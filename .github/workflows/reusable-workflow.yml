@@ -34,89 +34,132 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Step 1: Get Timestamp 
       - name: Set timestamp variable
         run: echo "TIMESTAMP=$(date +%Y%m%d%H%M%S)" >> $GITHUB_ENV
   
+      # Step 2: Checkout repository code
       - name: Checkout code
         uses: actions/checkout@v3
 
-      - name: Log in to JFrog Artifactory
+            # Set up Python (for semgrep installation)
+      # Step 3: Set up Python
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      # Step 4: Install Semgrep directly
+      - name: Install Semgrep
         run: |
-          echo "${{ secrets.JFROG_PASSWORD }}" | docker login \
-            -u "${{ secrets.JFROG_USERNAME }}" \
-            --password-stdin "${{ inputs.jfrog_repo_url }}"
+          pip install semgrep==1.50.0
+          semgrep --version
 
-      - name: Build Docker image
-        run: |
-          docker build -t "${{ inputs.jfrog_repo_url }}/${{ inputs.image_name }}:$TIMESTAMP" \
-            -f "${{ inputs.dockerfile_path }}" .
-
-      - name: Push Docker image to JFrog Artifactory
-        run: |
-          docker push "${{ inputs.jfrog_repo_url }}/${{ inputs.image_name }}:$TIMESTAMP"
-
-      - name: Pull the image to get the digest
-        run: docker pull "${{ inputs.jfrog_repo_url }}/${{ inputs.image_name }}:$TIMESTAMP"
-
-      - name: Get the image digest
-        run: echo "IMAGE_SHA=$(docker inspect --format='{{index .RepoDigests 0}}' ${{ inputs.jfrog_repo_url }}/${{ inputs.image_name }}:$TIMESTAMP | cut -d':' -f2)" >> $GITHUB_ENV
-
-      # Step 6: Download SSD Scanner CLI
+      # Step 5: Download SSD Scanner CLI with specific architecture
       - name: Download SSD Scanner CLI
         run: |
-          curl -L -o ssd-scanner-cli https://github.com/OpsMx/ssd-scanner-cli-public/releases/download/v0.0.49/ssd-scanner-cli-amd64
+          curl -L -o ssd-scanner-cli https://github.com/OpsMx/ssd-scanner-cli-public/releases/download/v0.0.50-alpha7/ssd-scanner-cli-amd64
           chmod +x ssd-scanner-cli
           sudo mv ssd-scanner-cli /usr/local/bin/
-      
-      # Step 7: Install Dependencies for Semgrep
-      - name: Install Dependencies for Semgrep
-        run: |
-          ssd-scanner-cli install-deps --scanners=semgrep --debug
+          # Verify the download
+          ssd-scanner-cli --version || echo "Failed to get version, but continuing"
 
-      # Step 8: Setup Scan Environment
+      # Step 6: Install other dependencies
+      - name: Install additional dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq bc
+
+      # Step 7: Check for .env and config files
+      - name: Examine source code structure
+        run: |
+          echo "=== Repository Structure ==="
+          find . -type f | grep -v "/.git/" | sort
+          
+          # Check if .env file exists
+          if [ -f ".env" ]; then
+            echo ".env file found - will be scanned for secrets"
+            LINES=$(wc -l < .env)
+            echo ".env contains $LINES lines"
+            echo "Lines potentially containing secrets: $(grep -i -E 'key|secret|password|token|credential' .env | wc -l)"
+          else
+            echo ".env file not found"
+          fi
+          
+          # Look for any files that might contain sensitive data
+          echo "=== Potential config/secret files ==="
+          find . -name "*.env*" -o -name "*.yaml" -o -name "*.yml" -o -name "*.conf" -o -name "*.config" -o -name "*.json" -o -name "*.properties" | grep -v "/.git/"
+
+      # Step 8: Setup Scan Environment with custom persistent directories
       - name: Setup Scan Environment
         run: |
-          SCAN_DIR="/tmp/ssd-scan-results"
-          REPORT_DIR="$(pwd)/scan-results"
+          CUSTOM_SCAN_DIR="${GITHUB_WORKSPACE}/scan-results-dir"
+          REPORT_DIR="${GITHUB_WORKSPACE}/report-dir"
+          LOG_DIR="${GITHUB_WORKSPACE}/logs-dir"
 
-          sudo rm -rf "$SCAN_DIR" "$REPORT_DIR" || true
-          sudo mkdir -p "$SCAN_DIR" "$REPORT_DIR"
-          sudo chmod -R 777 "$SCAN_DIR" "$REPORT_DIR"
+          mkdir -p "$CUSTOM_SCAN_DIR" "$REPORT_DIR" "$LOG_DIR"
+          chmod -R 777 "$CUSTOM_SCAN_DIR" "$REPORT_DIR" "$LOG_DIR"
 
-          echo "SCAN_DIR=$SCAN_DIR" >> $GITHUB_ENV
+          # Set environment variables for later steps
+          echo "CUSTOM_SCAN_DIR=$CUSTOM_SCAN_DIR" >> $GITHUB_ENV
+          echo "DEFAULT_SCAN_DIR=/home/runner/.local/bin/ssd-scan-results" >> $GITHUB_ENV
           echo "REPORT_DIR=$REPORT_DIR" >> $GITHUB_ENV
+          echo "LOG_DIR=$LOG_DIR" >> $GITHUB_ENV
+          
+      # Step 9: Push Image to JFrog Artifactory repo 
+      - name: Push Image to JFrog Artifactory
+        env:
+          JFROG_REPO_URL: ${{ secrets.JFROG_REPO_URL }}
+          JFROG_USERNAME: ${{ secrets.JFROG_USERNAME }}
+          JFROG_PASSWORD: ${{ secrets.JFROG_PASSWORD }}
 
-      # Step 9: Run All Scanners
-      - name: Run All Scanners
+      # Step 10: Login to JFrog
+      - name: Log in to JFrog Artifactory
+        run: |
+          echo "${JFROG_PASSWORD}" | docker login -u "${JFROG_USERNAME}" --password-stdin "${JFROG_REPO_URL}"
+
+          # Set the full image path for later use
+          FULL_IMAGE_PATH="trial451ad8.jfrog.io/dev-docker-docker/nginx:latest"
+          IMAGE_NAME="trial451ad8.jfrog.io/dev-docker-docker/nginx"
+          echo "FULL_IMAGE_PATH=${FULL_IMAGE_PATH}" >> $GITHUB_ENV
+          
+          # Pull the image
+          docker pull "${FULL_IMAGE_PATH}"
+          
+          # Create a new tag with timestamp
+          docker tag "${FULL_IMAGE_PATH}" "${IMAGE_NAME}:${TIMESTAMP}"
+          
+          # Important: Push the new tag to JFrog so scanner can access it
+          docker push "${IMAGE_NAME}:${TIMESTAMP}"
+          
+      # Step 11: Run Source Code Scans with SSD Scanner CLI
+      - name: Run Source Code Scans
         env:
           UPLOAD_URL: ${{ secrets.UPLOAD_URL }}
           SSD_TEAM_TOKEN: ${{ secrets.SSD_TEAM_TOKEN }}
         run: |
-          IMAGE_NAME="${{ inputs.jfrog_repo_url }}/${{ inputs.image_name }}"
-          IMAGE_TAG="$TIMESTAMP"
-          
-          echo "Using Image: $IMAGE_NAME:$IMAGE_TAG"
-          
+          echo "=== Running SOURCE CODE scans with SSD Scanner CLI ==="
           ssd-scanner-cli \
-            --scanners=semgrep,openssf,grype \
-            --scanners=codelicensescan,codesecretscan,sbom,imagelicensescan,imagesecretscan \
+            --scanners=trivy,semgrep,openssf \
+            --trivy-scanners=codelicensescan,codesecretscan,sbom,imagelicensescan,imagesecretscan \
             --artifact-type="image" \
-            --artifact-name="$IMAGE_NAME" \
-            --artifact-tag="$IMAGE_TAG" \
-            --snyk-api-token="$SNYK_API_TOKEN" \
-            --upload-url="$UPLOAD_URL" \
-            --ssd-token="$SSD_TEAM_TOKEN" \
-            --source-code-path="$GITHUB_WORKSPACE" \
+            --artifact-name="${IMAGE_NAME}" \
+            --artifact-tag="${TIMESTAMP}" \
+            --upload-url="${UPLOAD_URL}" \
+            --ssd-token="${SSD_TEAM_TOKEN}" \
+            --source-code-path="${GITHUB_WORKSPACE}" \
             --repository-url="https://github.com/${{ github.repository }}" \
             --branch="${{ github.ref_name }}" \
             --build-id="${{ github.run_id }}" \
             --offline-mode=false \
-            --debug=true
-
+            --debug=true \
+            --keep-results=true  \
+            
           SCAN_EXIT_CODE=$?
           echo "SCAN_EXIT_CODE=$SCAN_EXIT_CODE" >> $GITHUB_ENV
+          echo "SCAN_EXIT_CODE=$SCAN_EXIT_CODE"
 
-      # Step 10: Print Scan Results if offline mode is enabled
+      # Step 12: Print Scan Results if offline mode is enabled
       - name: Print Scan Results
         if: always()
         run: |
@@ -124,12 +167,11 @@ jobs:
           echo "Repository: ${{ github.repository }}"
           echo "Branch: ${{ github.ref_name }}"
           echo "Build ID: ${{ github.run_id }}"
-          echo "Image: ${{ inputs.jfrog_repo_url }}/${{ inputs.image_name }}":"$TIMESTAMP"
+          echo "Image: $IMAGE_NAME:$TIMESTAMP"
           echo "Scan Exit Code: ${{ env.SCAN_EXIT_CODE }}"
           echo ""
           echo "Scan result files:"
           find $SCAN_DIR -type f -exec echo "File: {}" \;
-
 
       # Step 13: Check scan status
       - name: Check scan status
@@ -139,3 +181,26 @@ jobs:
             echo "Security scan failed with exit code ${{ env.SCAN_EXIT_CODE }}"
             exit 1
           fi
+
+      # Step 14: Send Build Event to SSD
+      - name: Send Build Event to SSD
+        env:
+          SSD_URL: ${{ secrets.UPLOAD_URL }}
+        run: |
+          curl --location "${{ secrets.UPLOAD_URL }}/webhook/v1/ssd" \
+               --header "Content-Type: application/json" \
+               --data '{
+                 "jobname": "${{ github.workflow }}",
+                 "buildnumber": "${{ github.run_number }}",
+                 "joburl": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                 "gitcommit": "${{ github.sha }}",
+                 "builduser": "${{ github.actor }}",
+                 "giturl": "https://github.com/${{ github.repository }}",
+                 "gitbranch": "${{ github.ref_name }}",
+                 "artifacts": [
+                   {
+                     "image": "'"${IMAGE_NAME}"'",
+                     "service": "'"${TIMESTAMP}"'"
+                   }
+                 ]
+               }'
